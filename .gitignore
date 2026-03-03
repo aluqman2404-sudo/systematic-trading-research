@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+env/
+.conda/
+
+# OS
+.DS_Store
+
+# Data / outputs
+data.csv
+*.png
+*.parquet
+*.xlsx
+*.log
+
+# IDE
+.vscode/

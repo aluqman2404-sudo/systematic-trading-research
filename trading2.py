@@ -87,12 +87,12 @@ def backtest(df_signal, initial_capital=100, tx_cost=0.0, leverage=1.0):
 #===================================================================
 START_DATE = "2015-01-01"
 END_DATE = datetime.today().strftime("%Y-%m-%d")
-INITIAL_CAPITAL = 1000
+INITIAL_CAPITAL = 10000
 SHORT_SMA = 50
-LONG_SMA = 200
+LONG_SMA = 100
 TRANSACTION_COST = 0.00005
-TICKER = 'GBPUSD=X'
-LEVERAGE = 40
+TICKER = 'EURGBPX'
+LEVERAGE = 30
 
 df = download(TICKER, START_DATE, END_DATE)
 print(df)
