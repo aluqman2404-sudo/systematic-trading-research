@@ -202,26 +202,9 @@ def compute_net_payout_proxy(
     return float(score) if np.isfinite(score) else None
 
 
-def compute_stats(returns: pd.Series) -> dict[str, float]:
-    returns = returns.dropna()
-    if len(returns) < 2:
-        raise ValueError("Not enough return observations to compute statistics.")
-
-    equity = (1 + returns).cumprod()
-    days = (equity.index[-1] - equity.index[0]).days
-    years = max(days / 365.25, 1e-9)
-
-    cagr = float(equity.iloc[-1] ** (1 / years) - 1)
-    ann_vol = float(returns.std() * np.sqrt(252))
-    sharpe = float((returns.mean() * 252) / (returns.std() * np.sqrt(252) + 1e-12))
-    max_dd = float((equity / equity.cummax() - 1).min())
-
-    return {
-        "CAGR": cagr,
-        "Ann.Vol": ann_vol,
-        "Sharpe": sharpe,
-        "Max Drawdown": max_dd,
-    }
+def compute_stats(returns: pd.Series, benchmark_returns: pd.Series | None = None) -> dict[str, float]:
+    from performance import compute_perf_stats
+    return compute_perf_stats(returns, freq=252, benchmark_returns=benchmark_returns)
 
 
 def run_backtest(
@@ -362,34 +345,60 @@ def main():
         shares_cache_dir=Path(args.shares_cache_dir),
     )
 
-    stats = compute_stats(returns)
+    # ---- Benchmark: SPY total-return (daily, matched to backtest period) ----
+    spy_rets: pd.Series | None = None
+    try:
+        spy_raw = yf.download(
+            "SPY", start=returns.index[0].strftime("%Y-%m-%d"),
+            end=returns.index[-1].strftime("%Y-%m-%d"),
+            auto_adjust=True, progress=False,
+        )
+        if spy_raw is not None and len(spy_raw) > 0:
+            spy_px = spy_raw["Close"].dropna()
+            spy_rets = spy_px.pct_change().dropna()
+    except Exception:
+        pass
+
+    stats = compute_stats(returns, benchmark_returns=spy_rets)
+
+    all_report: dict[str, dict] = {"Net Payout Yield": stats}
+    if spy_rets is not None:
+        from performance import compute_perf_stats
+        all_report["SPY (B&H)"] = compute_perf_stats(
+            spy_rets.reindex(returns.index).dropna(), freq=252
+        )
+
+    from performance import print_stats_table, plot_tearsheet
+
+    print_stats_table(
+        all_report,
+        title=f"Net Payout Yield Strategy  "
+              f"({returns.index[0].date()} → {returns.index[-1].date()})",
+    )
+    print(f"  Rebalances with valid selections : {len(selections)}")
+
+    print(
+        "\nNote on survivorship bias: this backtest uses the current ticker "
+        "universe and excludes companies that were delisted, acquired, or went "
+        "bankrupt during the sample period. Results represent an upper-bound estimate."
+    )
+
     equity = (1 + returns).cumprod()
-
-    print("\n=== Backtest Results ===")
-    print(f"Start: {returns.index[0].date()}  End: {returns.index[-1].date()}")
-    print(f"CAGR: {stats['CAGR']:.2%}")
-    print(f"Annual Volatility: {stats['Ann.Vol']:.2%}")
-    print(f"Sharpe (rf=0): {stats['Sharpe']:.2f}")
-    print(f"Max Drawdown: {stats['Max Drawdown']:.2%}")
-    print(f"Rebalances with valid selections: {len(selections)}")
-
-    plt.figure(figsize=(10, 4))
-    plt.plot(equity.index, equity.values, linewidth=1.5, color="tab:blue")
-    plt.title("Net Payout Yield Effect (Terminal Backtest) - Equity Curve")
-    plt.ylabel("Equity (Growth of $1)")
-    plt.xlabel("Date")
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(args.plot_file, dpi=150)
-    print(f"Saved equity plot to: {args.plot_file}")
-    if args.show_plot:
-        plt.show()
-    plt.close()
 
     if args.save_equity:
         out = pd.DataFrame({"equity": equity, "returns": returns})
         out.to_csv(args.save_equity)
         print(f"Saved equity curve to: {args.save_equity}")
+
+    plot_tearsheet(
+        returns=returns,
+        benchmark_returns=spy_rets,
+        title="Net Payout Yield Strategy",
+        freq=252,
+        rolling_window=252,
+        save_path=args.plot_file,
+        show=args.show_plot,
+    )
 
 
 if __name__ == "__main__":
