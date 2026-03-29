@@ -65,19 +65,27 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 DEFAULT_START: str = "2005-01-01"
 DEFAULT_END: str = "2026-01-01"
 COST_PER_LEG: float = 0.0005          # 5 bps per leg per trade
-COINT_PVAL_THRESHOLD: float = 0.05
+COINT_PVAL_THRESHOLD: float = 0.10    # 10% — appropriate for rolling windows
+FORMATION_DAYS: int = 252             # 1-year look-back to test cointegration
+RETEST_EVERY: int = 63                # re-estimate parameters every quarter
 DEFAULT_LOOKBACK: int = 60            # rolling z-score window (trading days)
 DEFAULT_ENTRY_Z: float = 2.0
 DEFAULT_EXIT_Z: float = 0.5
 DEFAULT_STOP_Z: float = 3.0
 
+# Expanded universe: includes sector ETF pairs that are structurally linked
 CANDIDATE_PAIRS: list[tuple[str, str]] = [
-    ("SPY", "QQQ"),
-    ("XOM", "CVX"),
-    ("GLD", "GDX"),
-    ("KO",  "PEP"),
-    ("JPM", "BAC"),
-    ("WMT", "TGT"),
+    ("SPY",  "QQQ"),    # S&P 500 vs Nasdaq-100
+    ("XOM",  "CVX"),    # Integrated oil majors
+    ("GLD",  "GDX"),    # Gold bullion vs gold miners
+    ("GDX",  "GDXJ"),   # Senior vs junior gold miners
+    ("KO",   "PEP"),    # Beverage duopoly
+    ("JPM",  "BAC"),    # Money-centre banks
+    ("WMT",  "TGT"),    # Big-box retail
+    ("XLF",  "KBE"),    # Financials ETF vs bank ETF
+    ("XLE",  "OIH"),    # Energy ETF vs oil-services ETF
+    ("TLT",  "IEF"),    # Long-duration vs medium-duration Treasuries
+    ("IWM",  "MDY"),    # Small-cap vs mid-cap US equities
 ]
 
 
@@ -479,7 +487,179 @@ def backtest_pair(
 
 
 # ---------------------------------------------------------------------------
-# 5. Portfolio combination
+# 5. Rolling formation/trading window backtest (production approach)
+# ---------------------------------------------------------------------------
+
+def backtest_pair_rolling(
+    prices: pd.DataFrame,
+    pair: PairSpec,
+    formation_days: int = FORMATION_DAYS,
+    retest_every: int = RETEST_EVERY,
+    lookback: int = DEFAULT_LOOKBACK,
+    entry_z: float = DEFAULT_ENTRY_Z,
+    exit_z: float = DEFAULT_EXIT_Z,
+    stop_z: float = DEFAULT_STOP_Z,
+    cost_per_leg: float = COST_PER_LEG,
+    pval_threshold: float = COINT_PVAL_THRESHOLD,
+) -> tuple[pd.Series, TradeStats, list[dict]]:
+    """
+    Rolling formation/trading backtest — the correct approach for stat arb.
+
+    Procedure (matches Gatev, Goetzmann & Rouwenhorst 2006):
+    ─────────────────────────────────────────────────────────
+    Every `retest_every` trading days:
+      1. Look back `formation_days` days.
+      2. Run Engle-Granger cointegration test on the formation window.
+      3. If p-value < threshold: estimate OLS hedge ratio on formation data.
+      4. Apply those parameters to generate z-score signals for the next
+         `retest_every` trading days (the "trading period").
+      5. Advance to the next window and repeat.
+
+    This avoids the problem of testing cointegration on a 20-year history
+    (where structural breaks guarantee failure) and instead validates the
+    relationship in a rolling 1-year window — exactly how real desks operate.
+
+    Returns
+    -------
+    daily_returns : pd.Series
+    trade_stats   : TradeStats
+    window_log    : list[dict]  — per-window cointegration status
+    """
+    t1, t2 = pair.ticker1, pair.ticker2
+    if t1 not in prices.columns or t2 not in prices.columns:
+        return pd.Series(dtype=float), TradeStats(pair_label=pair.label), []
+
+    p = prices[[t1, t2]].dropna()
+    if len(p) < formation_days + retest_every:
+        return pd.Series(dtype=float), TradeStats(pair_label=pair.label), []
+
+    all_dates = p.index
+    position_series = pd.Series(0.0, index=all_dates)
+    window_log: list[dict] = []
+
+    # Walk-forward: retest at each quarter boundary
+    retest_indices = list(range(formation_days, len(p), retest_every))
+
+    current_beta: float = 1.0
+    current_intercept: float = 0.0
+    active: bool = False
+
+    for start_idx in retest_indices:
+        form_slice = p.iloc[start_idx - formation_days: start_idx]
+        lp1 = np.log(form_slice[t1])
+        lp2 = np.log(form_slice[t2])
+
+        try:
+            _, pvalue, _ = coint(lp1.values, lp2.values, trend="c", autolag="AIC")
+        except Exception:
+            pvalue = 1.0
+
+        cointegrated = bool(pvalue < pval_threshold)
+        if cointegrated:
+            current_intercept, current_beta = estimate_hedge_ratio(lp1, lp2)
+            active = True
+        else:
+            active = False
+
+        window_log.append({
+            "date": all_dates[start_idx],
+            "pvalue": round(pvalue, 4),
+            "cointegrated": cointegrated,
+            "beta": round(current_beta, 4) if cointegrated else float("nan"),
+        })
+
+        if not active:
+            continue
+
+        # Trading window
+        end_idx = min(start_idx + retest_every, len(p))
+        trade_idx = all_dates[start_idx: end_idx]
+        if len(trade_idx) < 2:
+            continue
+
+        # Z-score: use history from [start_idx - lookback] to end of trading window
+        hist_start = max(0, start_idx - lookback)
+        hist = p.iloc[hist_start: end_idx]
+        spread = np.log(hist[t1]) - (current_intercept + current_beta * np.log(hist[t2]))
+        roll_mu = spread.rolling(lookback, min_periods=lookback // 2).mean()
+        roll_sd = spread.rolling(lookback, min_periods=lookback // 2).std(ddof=1)
+        zscore_full = (spread - roll_mu) / (roll_sd + 1e-12)
+        zscore_trade = zscore_full.reindex(trade_idx)
+
+        # Signal generation (1-bar lag)
+        pos = 0.0
+        for i in range(1, len(trade_idx)):
+            dt = trade_idx[i]
+            z = zscore_trade.iloc[i - 1]
+            if np.isnan(z):
+                position_series[dt] = 0.0
+                continue
+            if pos == 0:
+                if z < -entry_z:
+                    pos = 1.0
+                elif z > entry_z:
+                    pos = -1.0
+            elif pos == 1:
+                if z > exit_z or z < -stop_z:
+                    pos = 0.0
+            elif pos == -1:
+                if z < exit_z or z > stop_z:
+                    pos = 0.0
+            position_series[dt] = pos
+
+    # Build daily returns from position series
+    log_p1 = np.log(p[t1])
+    log_p2 = np.log(p[t2])
+    ret1 = log_p1.diff()
+    ret2 = log_p2.diff()
+
+    weight_norm = 1.0 + abs(current_beta)
+    spread_ret = (ret1 - current_beta * ret2) / weight_norm
+
+    gross = position_series * spread_ret
+    cost_mask = position_series.diff().abs() > 0
+    cost_series = cost_mask.astype(float) * cost_per_leg * 2.0
+    daily_returns = (gross - cost_series).dropna()
+    daily_returns = daily_returns[daily_returns.index >= all_dates[formation_days]]
+
+    # Trade statistics
+    stats = TradeStats(pair_label=pair.label)
+    cumulative = (1.0 + daily_returns).cumprod()
+    pos_arr = position_series.reindex(daily_returns.index).values
+    prev_pos = 0
+    open_idx: Optional[int] = None
+    for i, cur_pos in enumerate(pos_arr):
+        cur_pos = int(cur_pos)
+        if prev_pos == 0 and cur_pos != 0:
+            open_idx = i
+        elif prev_pos != 0 and cur_pos == 0 and open_idx is not None:
+            stats.total_trades += 1
+            stats.total_holding_days += i - open_idx
+            cv = cumulative.values
+            tr = (cv[i] / cv[open_idx] - 1.0) if open_idx > 0 else 0.0
+            stats.pnl_list.append(tr)
+            if tr > 0:
+                stats.winning_trades += 1
+            open_idx = None
+        prev_pos = cur_pos
+
+    return daily_returns, stats, window_log
+
+
+def summarise_window_log(pair_label: str, window_log: list[dict]) -> None:
+    """Print a rolling-window cointegration summary for one pair."""
+    if not window_log:
+        return
+    n_total = len(window_log)
+    n_coint = sum(1 for w in window_log if w["cointegrated"])
+    pct = n_coint / n_total if n_total else 0.0
+    avg_pv = float(np.mean([w["pvalue"] for w in window_log]))
+    print(f"  {pair_label:<14}  {n_coint}/{n_total} windows cointegrated "
+          f"({pct:.0%})  avg p-value={avg_pv:.3f}")
+
+
+# ---------------------------------------------------------------------------
+# 6. Portfolio combination
 # ---------------------------------------------------------------------------
 
 def combine_portfolios(
@@ -624,23 +804,24 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         args = build_arg_parser().parse_args()
 
     print("\n" + "=" * 70)
-    print("  Statistical Pairs Trading Backtest")
-    print(f"  Period : {args.start}  →  {args.end}")
-    print(f"  Z-score thresholds : entry={args.entry_z}, exit={args.exit_z}, stop={args.stop_z}")
-    print(f"  Rolling lookback   : {args.lookback} days")
-    print(f"  Transaction costs  : {COST_PER_LEG * 1e4:.0f} bps per leg")
+    print("  Statistical Pairs Trading Backtest  (Rolling Formation Windows)")
+    print(f"  Period          : {args.start}  →  {args.end}")
+    print(f"  Formation window: {FORMATION_DAYS} days (1 year)")
+    print(f"  Retest every    : {RETEST_EVERY} days (quarterly)")
+    print(f"  Z-score         : entry=±{args.entry_z}, exit=±{args.exit_z}, stop=±{args.stop_z}")
+    print(f"  Coint threshold : p < {COINT_PVAL_THRESHOLD}")
+    print(f"  Transaction cost: {COST_PER_LEG * 1e4:.0f} bps per leg")
     print("=" * 70 + "\n")
 
     # -- Collect unique tickers ---------------------------------------------
     all_tickers: list[str] = list(
         dict.fromkeys(t for pair in CANDIDATE_PAIRS for t in pair)
     )
-    # Always include SPY for benchmark
     if "SPY" not in all_tickers:
         all_tickers.append("SPY")
 
     # -- Download -----------------------------------------------------------
-    print(f"Downloading price data for: {', '.join(all_tickers)}")
+    print(f"Downloading price data for: {', '.join(sorted(all_tickers))}")
     try:
         prices = download_prices(all_tickers, start=args.start, end=args.end)
     except RuntimeError as exc:
@@ -649,42 +830,42 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
 
     print(f"  → {len(prices)} trading days, {prices.shape[1]} tickers loaded.\n")
 
-    # -- Cointegration tests ------------------------------------------------
-    print("Running Engle-Granger cointegration tests…")
-    coint_results = find_cointegrated_pairs(prices, CANDIDATE_PAIRS)
+    # -- Rolling formation/trading backtests --------------------------------
+    print(f"Running rolling cointegration tests and backtests "
+          f"for {len(CANDIDATE_PAIRS)} candidate pairs…\n")
 
-    if not coint_results:
-        print("[FATAL] No pair results produced (all data downloads failed?).")
-        sys.exit(1)
-
-    print_coint_table(coint_results)
-
-    active_pairs = [cr for cr in coint_results if cr.is_cointegrated]
-    if not active_pairs:
-        print("[WARNING] No cointegrated pairs found. Try a wider date range or relaxed p-value threshold.")
-        sys.exit(0)
-
-    # -- Per-pair backtests -------------------------------------------------
-    print(f"Backtesting {len(active_pairs)} cointegrated pair(s)…\n")
     all_pair_returns: list[pd.Series] = []
     all_trade_stats: list[TradeStats] = []
 
-    for cr in active_pairs:
-        print(f"  Backtesting {cr.pair.label}  (β={cr.hedge_ratio:.4f}, τ={cr.half_life:.1f}d)…")
-        daily_rets, trade_stats = backtest_pair(
+    print(f"  {'Pair':<14}  Cointegration windows  avg p-value")
+    print("  " + "-" * 58)
+
+    for t1, t2 in CANDIDATE_PAIRS:
+        pair = PairSpec(ticker1=t1, ticker2=t2)
+        daily_rets, trade_stats, window_log = backtest_pair_rolling(
             prices=prices,
-            cr=cr,
+            pair=pair,
+            formation_days=FORMATION_DAYS,
+            retest_every=RETEST_EVERY,
             lookback=args.lookback,
             entry_z=args.entry_z,
             exit_z=args.exit_z,
             stop_z=args.stop_z,
             cost_per_leg=COST_PER_LEG,
+            pval_threshold=COINT_PVAL_THRESHOLD,
         )
-        if daily_rets.empty:
-            print(f"    → Insufficient data. Skipping {cr.pair.label}.")
+        summarise_window_log(pair.label, window_log)
+        if daily_rets.empty or trade_stats.total_trades == 0:
+            print(f"    → No trades generated for {pair.label}. Skipping.")
             continue
-        all_pair_returns.append(daily_rets.rename(cr.pair.label))
+        all_pair_returns.append(daily_rets.rename(pair.label))
         all_trade_stats.append(trade_stats)
+
+    print()
+
+    if not all_pair_returns:
+        print("[WARNING] No pairs generated trades. Check data availability.")
+        sys.exit(0)
 
     if not all_pair_returns:
         print("[FATAL] All pair backtests returned empty return series.")
