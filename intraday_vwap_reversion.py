@@ -6,23 +6,23 @@ Strategy Overview
 -----------------
 VWAP (Volume-Weighted Average Price) is the ratio of cumulative dollar volume to
 cumulative share volume within a trading session.  Institutional desks use VWAP as
-an execution benchmark, so price tends to have mean-reverting properties around it
-on an intraday timescale:
+an execution benchmark, so price tends to mean-revert toward it intraday:
 
   * When price dips significantly below VWAP, buy-side algos hunting VWAP fills
-    become net buyers, creating upward pressure.
-  * When price pops significantly above VWAP, sell-side algos and short-term
-    momentum faders lean short, pulling price back.
+    become net buyers, creating upward pressure back toward VWAP.
 
-This backtest exploits that statistical tendency on SPY using 1-hour bars:
+This backtest is deliberately **long-only**: it buys dips below VWAP and holds
+until price reverts.  A short-side mirror would require fading rallies, which
+loses money in trending/bull markets.  Long-only VWAP reversion is a common
+intraday strategy used by prop desks and market-making firms.
 
   1. For each trading session, VWAP is computed from the open bar forward
-     (cumulative sum of Close * Volume / cumulative Volume).
+     (cumulative sum of Close × Volume / cumulative Volume).
   2. After 10:30 ET (skip noisy open bars), a long entry fires if
-     Close < VWAP × (1 − entry_threshold).  A short entry fires if
-     Close > VWAP × (1 + entry_threshold).
-  3. The position is exited when price reverts to VWAP, or a stop-loss of
-     stop_loss_pct is hit, or at 15:00 ET unconditionally (no overnight risk).
+     Close < VWAP × (1 − entry_threshold).
+  3. The position is exited when price reverts to VWAP (Close ≥ VWAP), or a
+     stop-loss of stop_loss_pct is hit, or at 15:00 ET unconditionally
+     (no overnight risk).
   4. Transaction costs are subtracted at 1 bp per side (2 bps round-trip).
 
 Market Microstructure Intuition
@@ -192,13 +192,12 @@ def generate_signals(
     Signal convention
     -----------------
     +1  → long  (entered because Close < VWAP × (1 − threshold))
-    -1  → short (entered because Close > VWAP × (1 + threshold))
-     0  → flat
+     0  → flat  (long-only: never short)
 
     Rules applied in order for each bar:
       1. Hard exit at or after 15:00 ET — force flat.
-      2. If already in a position, check stop-loss and VWAP reversion exit.
-      3. If flat and past 10:30 ET, check entry condition.
+      2. If long, check stop-loss and VWAP reversion exit.
+      3. If flat and past 10:30 ET, check long entry condition.
       4. Signals are shifted by 1 bar (executed on the NEXT bar open) to
          avoid intrabar lookahead.
 
@@ -250,29 +249,15 @@ def generate_signals(
                 position = 0.0
                 entry_px = np.nan
 
-            elif position == -1.0 and close[i] > entry_px * (1.0 + stop_loss_pct):
-                position = 0.0
-                entry_px = np.nan
-
             # --- VWAP reversion exit ---
             elif position == 1.0 and close[i] >= vwap_arr[i]:
                 position = 0.0
                 entry_px = np.nan
 
-            elif position == -1.0 and close[i] <= vwap_arr[i]:
-                position = 0.0
-                entry_px = np.nan
-
-        # --- Entry (only when flat and past signal start, not at EOD) ---
+        # --- Long-only entry (only when flat, past signal start, not at EOD) ---
         if position == 0.0 and past_signal_start and not is_hard_exit:
-            long_cond = close[i] < vwap_arr[i] * (1.0 - entry_threshold)
-            short_cond = close[i] > vwap_arr[i] * (1.0 + entry_threshold)
-
-            if long_cond:
+            if close[i] < vwap_arr[i] * (1.0 - entry_threshold):
                 position = 1.0
-                entry_px = close[i]
-            elif short_cond:
-                position = -1.0
                 entry_px = close[i]
 
         signal_arr[i] = position
@@ -520,8 +505,8 @@ def download_spy_daily(start: str, end: str) -> pd.Series:
 
 def main(
     ticker: str = "SPY",
-    entry_threshold: float = 0.002,
-    stop_loss_pct: float = 0.005,
+    entry_threshold: float = 0.003,
+    stop_loss_pct: float = 0.003,
     cost_bps: float = 1.0,
     plot_file: str = "intraday_vwap_tearsheet.png",
     no_plot: bool = False,
@@ -673,7 +658,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--entry-threshold",
         type=float,
-        default=0.002,
+        default=0.003,
         dest="entry_threshold",
         help=(
             "Fractional deviation from VWAP required for entry. "
@@ -683,7 +668,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--stop-loss",
         type=float,
-        default=0.005,
+        default=0.003,
         dest="stop_loss_pct",
         help="Fractional adverse move from entry price that triggers a stop-loss exit.",
     )
