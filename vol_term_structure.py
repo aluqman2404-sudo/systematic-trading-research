@@ -286,10 +286,8 @@ def run_term_structure_strategy(
     vix = df["VIX"]
 
     long_signal = (slope > contango_threshold) & (vix <= vix_crisis_level)
-    flat_signal = (slope < -contango_threshold) | (vix > vix_crisis_level)
-    # Between thresholds with VIX <= crisis: flat (neutral zone)
 
-    raw_position = long_signal.astype(float)  # 1 or 0
+    raw_position = long_signal.astype(float)  # 1 = long SVXY, 0 = flat
 
     # 1-day lag: today's signal determines tomorrow's position
     position = raw_position.shift(1).fillna(0.0)
