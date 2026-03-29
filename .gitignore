@@ -20,6 +20,20 @@ data.csv
 *.parquet
 *.xlsx
 *.log
+*.pkl
+*.csv
+*.save
+
+# Cache directories
+.cache/
+.claude/
+
+# Node
+node_modules/
+package-lock.json
+
+# Keep ticker list (used as strategy input)
+!tickers_us_1500.txt
 
 # IDE
 .vscode/
